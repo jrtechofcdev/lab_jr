@@ -1,0 +1,848 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly APP_NAME="JR Wi-Fi Lab"
+readonly VERSION="1.0.0"
+readonly DEAUTH_ROUNDS=1
+readonly MAX_DEAUTH_ATTEMPTS=2
+readonly DEAUTH_COOLDOWN_SECONDS=30
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -f "$SCRIPT_DIR/lib/airodump_csv.py" ]]; then
+    PARSER="$SCRIPT_DIR/lib/airodump_csv.py"
+elif [[ -f "/usr/local/lib/jr-wifi-lab/airodump_csv.py" ]]; then
+    PARSER="/usr/local/lib/jr-wifi-lab/airodump_csv.py"
+else
+    PARSER=""
+fi
+
+SCAN_SECONDS=18
+BAND=""
+AUTHORIZED_FLAG=0
+DRY_RUN=0
+COLOR_ENABLED=1
+[[ -t 1 ]] || COLOR_ENABLED=0
+[[ -n "${NO_COLOR:-}" ]] && COLOR_ENABLED=0
+
+CONFIG_DIR="${JR_WIFI_LAB_CONFIG_DIR:-/etc/jr-wifi-lab}"
+CAPTURE_ROOT="${JR_WIFI_LAB_CAPTURE_DIR:-/var/lib/jr-wifi-lab/captures}"
+AUTH_FILE="$CONFIG_DIR/authorized_bssids"
+
+SESSION_DIR=""
+SESSION_LOG=""
+SCAN_CSV=""
+CAPTURE_PREFIX=""
+CAPTURE_PID=""
+MON_IFACE=""
+ORIGINAL_IFACE=""
+ORIGINAL_PHY=""
+MON_STARTED=0
+SERVICES_PAUSED=0
+NETWORK_MANAGER_WAS_ACTIVE=0
+WPA_SUPPLICANT_WAS_ACTIVE=0
+CLEANED_UP=0
+OPENED_WIRESHARK=0
+DEAUTH_ATTEMPTS=0
+LAST_DEAUTH_EPOCH=0
+
+TARGET_BSSID=""
+TARGET_CHANNEL=""
+TARGET_ESSID=""
+TARGET_PRIVACY=""
+
+INPUT_VALUE=""
+EAPOL_COUNT=0
+EAPOL_MESSAGES=""
+
+declare -a AP_BSSIDS=()
+declare -a AP_CHANNELS=()
+declare -a AP_POWERS=()
+declare -a AP_PRIVACY=()
+declare -a AP_CIPHERS=()
+declare -a AP_AUTHS=()
+declare -a AP_CLIENTS=()
+declare -a AP_ESSIDS=()
+declare -a CLIENT_MACS=()
+declare -a CLIENT_POWERS=()
+declare -a CLIENT_PACKETS=()
+
+C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_DIM=""
+
+init_colors() {
+    if (( COLOR_ENABLED )); then
+        C_RESET=$'\033[0m'
+        C_RED=$'\033[1;31m'
+        C_GREEN=$'\033[1;32m'
+        C_YELLOW=$'\033[1;33m'
+        C_BLUE=$'\033[1;34m'
+        C_CYAN=$'\033[1;36m'
+        C_DIM=$'\033[2m'
+    else
+        C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_DIM=""
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+JR Wi-Fi Lab — seleção interativa para Aircrack-ng e Wireshark
+
+Uso:
+  sudo ./jr-wifi-lab [opções]
+
+Opções:
+  --authorized          confirma que o uso é em rede própria/autorizada
+  --scan-seconds N      duração da varredura, de 5 a 180 segundos (padrão: 18)
+  --band bg|a|abg       2,4 GHz, 5 GHz ou ambas
+  --dry-run             valida a instalação sem alterar a interface
+  --no-color            desativa cores ANSI
+  -h, --help            mostra esta ajuda
+  -V, --version         mostra a versão
+
+O programa não possui wordlist, força bruta, PMKID ou quebra de senha. A ação
+ativa disponível é limitada a uma rodada direcionada por tentativa, somente
+para um cliente associado a um BSSID previamente autorizado.
+EOF
+}
+
+log() {
+    local level="$1"
+    shift
+    if [[ -n "$SESSION_LOG" ]]; then
+        printf '%s [%s] %s\n' "$(date --iso-8601=seconds)" "$level" "$*" >>"$SESSION_LOG"
+    fi
+}
+
+info() {
+    printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+    log INFO "$*"
+}
+
+success() {
+    printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+    log OK "$*"
+}
+
+warn() {
+    printf '%s[AVISO]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+    log AVISO "$*"
+}
+
+die() {
+    printf '%s[ERRO]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+    log ERRO "$*"
+    exit 1
+}
+
+need_argument() {
+    [[ $# -ge 2 && -n "${2:-}" ]] || die "A opcao $1 exige um valor."
+}
+
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            --authorized)
+                AUTHORIZED_FLAG=1
+                ;;
+            --scan-seconds)
+                need_argument "$@"
+                [[ "$2" =~ ^[0-9]+$ ]] || die "--scan-seconds precisa ser numerico."
+                ((${#2} <= 3)) || die "--scan-seconds deve ficar entre 5 e 180."
+                (( 10#$2 >= 5 && 10#$2 <= 180 )) || die "--scan-seconds deve ficar entre 5 e 180."
+                SCAN_SECONDS="$((10#$2))"
+                shift
+                ;;
+            --band)
+                need_argument "$@"
+                case "$2" in
+                    bg|a|abg) BAND="$2" ;;
+                    *) die "Banda invalida. Use bg, a ou abg." ;;
+                esac
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --no-color)
+                COLOR_ENABLED=0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -V|--version)
+                printf '%s %s\n' "$APP_NAME" "$VERSION"
+                exit 0
+                ;;
+            *)
+                die "Opcao desconhecida: $1"
+                ;;
+        esac
+        shift
+    done
+}
+
+print_banner() {
+    printf '%s' "$C_CYAN"
+    cat <<'EOF'
+     _ ____    __        ___       _____ _   _          _          _
+    | |  _ \   \ \      / (_)     |  ___(_) | |    __ _| |__      | |
+ _  | | |_) |   \ \ /\ / /| |____| |_  | | | |   / _` | '_ \  _  | |
+| |_| |  _ <     \ V  V / | |____|  _| | | | |__| (_| | |_) || |_| |
+ \___/|_| \_\     \_/\_/  |_|    |_|   |_| |_____\__,_|_.__/  \___/
+EOF
+    printf '%s%sVersao %s — captura e analise; nunca quebra de senha.%s\n\n' "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
+}
+
+prompt_range() {
+    local prompt="$1" min="$2" max="$3" default_value="${4:-}"
+    local answer numeric_answer
+    while true; do
+        if [[ -n "$default_value" ]]; then
+            read -r -p "$prompt [$default_value]: " answer
+            answer="${answer:-$default_value}"
+        else
+            read -r -p "$prompt: " answer
+        fi
+        if [[ "$answer" =~ ^[0-9]+$ ]] && ((${#answer} <= 6)); then
+            numeric_answer="$((10#$answer))"
+            if (( numeric_answer >= min && numeric_answer <= max )); then
+                INPUT_VALUE="$numeric_answer"
+                return 0
+            fi
+        fi
+        warn "Escolha um numero entre $min e $max."
+    done
+}
+
+confirm_yes() {
+    local prompt="$1" answer
+    read -r -p "$prompt [s/N]: " answer
+    [[ "${answer,,}" == "s" || "${answer,,}" == "sim" ]]
+}
+
+validate_absolute_dir() {
+    local value="$1" label="$2"
+    [[ "$value" == /* ]] || die "$label deve ser um caminho absoluto."
+    [[ "$value" != "/" ]] || die "$label nao pode apontar para a raiz do sistema."
+    [[ "$value" != *$'\n'* ]] || die "$label contem caracteres invalidos."
+}
+
+prepare_directories() {
+    validate_absolute_dir "$CONFIG_DIR" "JR_WIFI_LAB_CONFIG_DIR"
+    validate_absolute_dir "$CAPTURE_ROOT" "JR_WIFI_LAB_CAPTURE_DIR"
+    umask 027
+    install -d -m 0750 "$CONFIG_DIR" "$CAPTURE_ROOT"
+    if [[ ! -e "$AUTH_FILE" ]]; then
+        install -m 0600 /dev/null "$AUTH_FILE"
+    fi
+    SESSION_DIR="$(mktemp -d "$CAPTURE_ROOT/session-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+    chmod 0750 "$SESSION_DIR"
+    SESSION_LOG="$SESSION_DIR/session.log"
+    : >"$SESSION_LOG"
+    chmod 0640 "$SESSION_LOG"
+}
+
+require_root() {
+    (( EUID == 0 )) || die "Execute com sudo: sudo $0"
+}
+
+safety_gate() {
+    (( AUTHORIZED_FLAG )) && return 0
+    printf '%sUso autorizado somente%s\n' "$C_YELLOW" "$C_RESET"
+    printf 'Redes vizinhas podem aparecer na varredura. Use apenas seu roteador de teste\n'
+    printf 'ou uma rede para a qual voce possua autorizacao expressa.\n\n'
+    local phrase
+    read -r -p 'Digite exatamente "EU TENHO AUTORIZACAO" para continuar: ' phrase
+    [[ "$phrase" == "EU TENHO AUTORIZACAO" ]] || die "Confirmacao nao recebida; nenhuma alteracao foi feita."
+}
+
+require_dependencies() {
+    local required=(airmon-ng airodump-ng aireplay-ng iw ip python3 timeout base64)
+    local missing=() command_name
+    for command_name in "${required[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    [[ -n "$PARSER" ]] || missing+=("airodump_csv.py")
+    if ((${#missing[@]})); then
+        die "Dependencias ausentes: ${missing[*]}. Rode sudo ./install.sh"
+    fi
+    if ! command -v tshark >/dev/null 2>&1; then
+        warn "tshark nao encontrado: a captura funcionara, mas a validacao EAPOL ficara para o Wireshark."
+    fi
+}
+
+service_active() {
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1"
+}
+
+remember_service_state() {
+    service_active NetworkManager && NETWORK_MANAGER_WAS_ACTIVE=1 || true
+    service_active wpa_supplicant && WPA_SUPPLICANT_WAS_ACTIVE=1 || true
+}
+
+stop_tracked_pid() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid" 2>/dev/null || true
+        local attempt
+        for attempt in {1..30}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+stop_target_capture() {
+    if [[ -n "$CAPTURE_PID" ]]; then
+        stop_tracked_pid "$CAPTURE_PID"
+        CAPTURE_PID=""
+        sleep 1
+    fi
+}
+
+restore_services() {
+    (( SERVICES_PAUSED )) || return 0
+    if (( NETWORK_MANAGER_WAS_ACTIVE )); then
+        systemctl restart NetworkManager >/dev/null 2>&1 || true
+    fi
+    if (( WPA_SUPPLICANT_WAS_ACTIVE )); then
+        systemctl restart wpa_supplicant >/dev/null 2>&1 || true
+    fi
+    command -v nmcli >/dev/null 2>&1 && nmcli radio wifi on >/dev/null 2>&1 || true
+}
+
+cleanup() {
+    local exit_code=$?
+    (( CLEANED_UP )) && return "$exit_code"
+    CLEANED_UP=1
+    stop_target_capture
+    if (( MON_STARTED )) && [[ -n "$MON_IFACE" ]]; then
+        info "Restaurando a interface Wi-Fi..."
+        airmon-ng stop "$MON_IFACE" >>"${SESSION_LOG:-/dev/null}" 2>&1 || true
+    fi
+    restore_services
+    return "$exit_code"
+}
+
+list_wireless_interfaces() {
+    iw dev 2>/dev/null | awk '$1 == "Interface" {print $2}'
+}
+
+interface_type() {
+    iw dev "$1" info 2>/dev/null | awk '$1 == "type" {print $2; exit}'
+}
+
+interface_phy() {
+    iw dev "$1" info 2>/dev/null | awk '$1 == "wiphy" {print $2; exit}'
+}
+
+select_interface() {
+    local -a interfaces=()
+    mapfile -t interfaces < <(list_wireless_interfaces)
+    ((${#interfaces[@]})) || die "Nenhuma interface Wi-Fi foi detectada por 'iw dev'."
+
+    printf '%sInterfaces Wi-Fi%s\n' "$C_CYAN" "$C_RESET"
+    local index iface iface_type phy
+    for index in "${!interfaces[@]}"; do
+        iface="${interfaces[$index]}"
+        iface_type="$(interface_type "$iface")"
+        phy="$(interface_phy "$iface")"
+        printf '  %d) %-15s tipo=%-8s phy=%s\n' "$((index + 1))" "$iface" "${iface_type:-?}" "${phy:-?}"
+    done
+    prompt_range "Escolha a interface" 1 "${#interfaces[@]}" 1
+    ORIGINAL_IFACE="${interfaces[$((INPUT_VALUE - 1))]}"
+    ORIGINAL_PHY="$(interface_phy "$ORIGINAL_IFACE")"
+    [[ -n "$ORIGINAL_PHY" ]] || die "Nao foi possivel identificar o radio da interface $ORIGINAL_IFACE."
+}
+
+choose_band() {
+    [[ -n "$BAND" ]] && return 0
+    printf '\n%sFaixa da varredura%s\n' "$C_CYAN" "$C_RESET"
+    printf '  1) 2,4 GHz (maior compatibilidade)\n'
+    printf '  2) 5 GHz\n'
+    printf '  3) 2,4 + 5 GHz\n'
+    prompt_range "Escolha a faixa" 1 3 3
+    case "$INPUT_VALUE" in
+        1) BAND="bg" ;;
+        2) BAND="a" ;;
+        3) BAND="abg" ;;
+    esac
+}
+
+pause_interfering_processes() {
+    local check_output
+    check_output="$(airmon-ng check 2>/dev/null || true)"
+    if ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+' <<<"$check_output"; then
+        return 0
+    fi
+
+    printf '\n%sProcessos que podem interferir no modo monitor:%s\n' "$C_YELLOW" "$C_RESET"
+    printf '%s\n' "$check_output"
+    if confirm_yes "Pausar esses processos durante a sessao e restaura-los ao sair?"; then
+        remember_service_state
+        SERVICES_PAUSED=1
+        airmon-ng check kill >>"$SESSION_LOG" 2>&1 || die "Nao foi possivel pausar os processos conflitantes."
+        success "Processos pausados; o estado sera restaurado automaticamente."
+    else
+        warn "Prosseguindo sem pausar processos; o modo monitor pode ficar instavel."
+    fi
+}
+
+find_monitor_on_phy() {
+    local iface candidate_type candidate_phy
+    while IFS= read -r iface; do
+        candidate_type="$(interface_type "$iface")"
+        candidate_phy="$(interface_phy "$iface")"
+        if [[ "$candidate_type" == "monitor" && "$candidate_phy" == "$ORIGINAL_PHY" ]]; then
+            printf '%s\n' "$iface"
+            return 0
+        fi
+    done < <(list_wireless_interfaces)
+    return 1
+}
+
+enable_monitor_mode() {
+    local current_type output
+    current_type="$(interface_type "$ORIGINAL_IFACE")"
+    if [[ "$current_type" == "monitor" ]]; then
+        MON_IFACE="$ORIGINAL_IFACE"
+        success "$MON_IFACE ja esta em modo monitor."
+        return 0
+    fi
+
+    output="$(airmon-ng start "$ORIGINAL_IFACE" 2>&1)" || {
+        printf '%s\n' "$output" >>"$SESSION_LOG"
+        die "Falha ao ativar modo monitor em $ORIGINAL_IFACE."
+    }
+    printf '%s\n' "$output" >>"$SESSION_LOG"
+    MON_IFACE="$(find_monitor_on_phy || true)"
+    [[ -n "$MON_IFACE" ]] || die "O airmon-ng terminou, mas nenhuma interface monitor foi localizada."
+    MON_STARTED=1
+    success "Modo monitor ativo em $MON_IFACE."
+}
+
+spinner_wait() {
+    local pid="$1" label="$2" frame=0
+    local -a frames=('|' '/' '-' '\\')
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r%s %s' "${frames[$((frame % 4))]}" "$label"
+        frame=$((frame + 1))
+        sleep 0.2
+    done
+    printf '\r%-70s\r' ' '
+}
+
+run_scan() {
+    local prefix="$SESSION_DIR/scan" scan_log="$SESSION_DIR/scan-output.log"
+    local -a command=(timeout --signal=INT --kill-after=3 "${SCAN_SECONDS}s" airodump-ng)
+    [[ -n "$BAND" ]] && command+=(--band "$BAND")
+    command+=(--write-interval 1 --output-format csv --write "$prefix" "$MON_IFACE")
+
+    info "Varrendo redes por ${SCAN_SECONDS}s em $MON_IFACE..."
+    "${command[@]}" >"$scan_log" 2>&1 &
+    local scan_pid=$! scan_status
+    spinner_wait "$scan_pid" "Aguardando a varredura"
+    if wait "$scan_pid"; then
+        scan_status=0
+    else
+        scan_status=$?
+    fi
+    if [[ "$scan_status" -ne 0 && "$scan_status" -ne 124 && "$scan_status" -ne 130 ]]; then
+        warn "A varredura terminou com codigo $scan_status; conferindo o arquivo gerado."
+    fi
+
+    SCAN_CSV="$(find "$SESSION_DIR" -maxdepth 1 -type f -name 'scan-*.csv' -print -quit)"
+    [[ -n "$SCAN_CSV" && -s "$SCAN_CSV" ]] || die "A varredura nao gerou CSV. Veja $scan_log"
+}
+
+b64decode() {
+    local value="$1"
+    [[ -n "$value" ]] || return 0
+    printf '%s' "$value" | base64 --decode 2>/dev/null || true
+}
+
+display_text() {
+    local value="$1" max_length="$2"
+    value="${value//$'\n'/ }"
+    value="${value//$'\r'/ }"
+    value="${value//$'\t'/ }"
+    [[ -n "$value" ]] || value="<oculta>"
+    if ((${#value} > max_length)); then
+        printf '%s...' "${value:0:max_length-3}"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+load_access_points() {
+    AP_BSSIDS=() AP_CHANNELS=() AP_POWERS=() AP_PRIVACY=()
+    AP_CIPHERS=() AP_AUTHS=() AP_CLIENTS=() AP_ESSIDS=()
+    local row bssid channel power privacy64 cipher64 auth64 clients essid64
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS='|' read -r bssid channel power privacy64 cipher64 auth64 clients essid64 <<<"$row"
+        AP_BSSIDS+=("$bssid")
+        AP_CHANNELS+=("$channel")
+        AP_POWERS+=("$power")
+        AP_PRIVACY+=("$(b64decode "$privacy64")")
+        AP_CIPHERS+=("$(b64decode "$cipher64")")
+        AP_AUTHS+=("$(b64decode "$auth64")")
+        AP_CLIENTS+=("$clients")
+        AP_ESSIDS+=("$(b64decode "$essid64")")
+    done < <(python3 "$PARSER" "$SCAN_CSV" aps --secured-only)
+}
+
+select_access_point() {
+    load_access_points
+    ((${#AP_BSSIDS[@]})) || die "Nenhuma rede WPA foi encontrada. Aumente o tempo ou troque a faixa da varredura."
+
+    printf '\n%sRedes WPA encontradas%s\n' "$C_CYAN" "$C_RESET"
+    printf '  %-3s %-27s %-17s %4s %6s %-12s %8s\n' '#' 'REDE' 'BSSID' 'CAN' 'SINAL' 'SEGURANCA' 'CLIENTES'
+    local index essid security
+    for index in "${!AP_BSSIDS[@]}"; do
+        essid="$(display_text "${AP_ESSIDS[$index]}" 27)"
+        security="$(display_text "${AP_PRIVACY[$index]}" 12)"
+        printf '  %-3d %-27s %-17s %4s %6s %-12s %8s\n' \
+            "$((index + 1))" "$essid" "${AP_BSSIDS[$index]}" "${AP_CHANNELS[$index]}" \
+            "${AP_POWERS[$index]}" "$security" "${AP_CLIENTS[$index]}"
+    done
+
+    prompt_range "Escolha somente seu AP autorizado" 1 "${#AP_BSSIDS[@]}"
+    local selected=$((INPUT_VALUE - 1))
+    TARGET_BSSID="${AP_BSSIDS[$selected]}"
+    TARGET_CHANNEL="${AP_CHANNELS[$selected]}"
+    TARGET_ESSID="${AP_ESSIDS[$selected]}"
+    TARGET_PRIVACY="${AP_PRIVACY[$selected]}"
+    [[ "$TARGET_CHANNEL" =~ ^[0-9]+$ ]] && (( TARGET_CHANNEL > 0 )) || die "O AP selecionado esta sem canal valido."
+}
+
+authorized_bssid() {
+    grep -Fxiq -- "$1" "$AUTH_FILE" 2>/dev/null
+}
+
+authorize_selected_bssid() {
+    authorized_bssid "$TARGET_BSSID" && {
+        success "BSSID consta na lista local de alvos autorizados."
+        return 0
+    }
+
+    local compact suffix expected answer
+    compact="${TARGET_BSSID//:/}"
+    suffix="${compact: -6}"
+    expected="AUTORIZO $suffix"
+    printf '\n%sNovo BSSID%s: %s (%s)\n' "$C_YELLOW" "$C_RESET" "$TARGET_BSSID" "$(display_text "$TARGET_ESSID" 40)"
+    printf 'Para evitar agir por engano em uma rede vizinha, este BSSID precisa ser\n'
+    printf 'adicionado a lista local de equipamentos do laboratorio.\n'
+    read -r -p "Digite exatamente '$expected': " answer
+    [[ "$answer" == "$expected" ]] || die "BSSID nao autorizado; encerrando sem captura direcionada."
+    printf '%s\n' "$TARGET_BSSID" >>"$AUTH_FILE"
+    chmod 0600 "$AUTH_FILE"
+    success "BSSID autorizado localmente."
+}
+
+start_target_capture() {
+    CAPTURE_PREFIX="$SESSION_DIR/target"
+    local capture_log="$SESSION_DIR/target-output.log"
+    iw dev "$MON_IFACE" set channel "$TARGET_CHANNEL" >>"$SESSION_LOG" 2>&1 || true
+    airodump-ng --bssid "$TARGET_BSSID" --channel "$TARGET_CHANNEL" \
+        --write-interval 1 --output-format pcap,csv --write "$CAPTURE_PREFIX" \
+        "$MON_IFACE" >"$capture_log" 2>&1 &
+    CAPTURE_PID=$!
+    sleep 2
+    kill -0 "$CAPTURE_PID" 2>/dev/null || die "A captura direcionada nao iniciou. Veja $capture_log"
+    success "Captura ativa no canal $TARGET_CHANNEL."
+}
+
+latest_capture_csv() {
+    find "$SESSION_DIR" -maxdepth 1 -type f -name 'target-*.csv' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | awk 'NR == 1 {$1=""; sub(/^ /, ""); print; exit}'
+}
+
+latest_capture_file() {
+    find "$SESSION_DIR" -maxdepth 1 -type f \( -name 'target-*.cap' -o -name 'target-*.pcap' \) \
+        -printf '%T@ %p\n' 2>/dev/null | sort -nr \
+        | awk 'NR == 1 {$1=""; sub(/^ /, ""); print; exit}'
+}
+
+load_clients() {
+    CLIENT_MACS=() CLIENT_POWERS=() CLIENT_PACKETS=()
+    local csv_file row mac power packets probes64
+    csv_file="$(latest_capture_csv)"
+    [[ -n "$csv_file" && -s "$csv_file" ]] || return 0
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS='|' read -r mac power packets probes64 <<<"$row"
+        CLIENT_MACS+=("$mac")
+        CLIENT_POWERS+=("$power")
+        CLIENT_PACKETS+=("$packets")
+    done < <(python3 "$PARSER" "$csv_file" stations --bssid "$TARGET_BSSID")
+}
+
+show_clients() {
+    load_clients
+    printf '\n%sClientes associados a %s%s\n' "$C_CYAN" "$(display_text "$TARGET_ESSID" 35)" "$C_RESET"
+    if ((${#CLIENT_MACS[@]} == 0)); then
+        warn "Nenhum cliente associado apareceu ainda. Aguarde e atualize a lista."
+        return 1
+    fi
+    printf '  %-3s %-17s %7s %10s\n' '#' 'CLIENTE' 'SINAL' 'PACOTES'
+    local index
+    for index in "${!CLIENT_MACS[@]}"; do
+        printf '  %-3d %-17s %7s %10s\n' "$((index + 1))" "${CLIENT_MACS[$index]}" \
+            "${CLIENT_POWERS[$index]}" "${CLIENT_PACKETS[$index]}"
+    done
+}
+
+read_capture_status() {
+    EAPOL_COUNT=0
+    EAPOL_MESSAGES=""
+    command -v tshark >/dev/null 2>&1 || return 2
+    local capture_file raw line message
+    capture_file="$(latest_capture_file)"
+    [[ -n "$capture_file" && -s "$capture_file" ]] || return 1
+
+    raw="$(tshark -r "$capture_file" -Y "eapol && wlan.addr == $TARGET_BSSID" \
+        -T fields -e frame.number -e wlan_rsna_eapol.keydes.msgnr 2>/dev/null || true)"
+    [[ -n "$raw" ]] || return 1
+
+    local -a unique_messages=()
+    while IFS=$'\t' read -r _frame message; do
+        [[ -n "${_frame:-}" ]] || continue
+        EAPOL_COUNT=$((EAPOL_COUNT + 1))
+        if [[ "$message" =~ ^[1-4]$ ]] && [[ " ${unique_messages[*]} " != *" $message "* ]]; then
+            unique_messages+=("$message")
+        fi
+    done <<<"$raw"
+    if ((${#unique_messages[@]})); then
+        mapfile -t unique_messages < <(printf '%s\n' "${unique_messages[@]}" | sort -n -u)
+        EAPOL_MESSAGES="${unique_messages[*]}"
+    fi
+
+    [[ " $EAPOL_MESSAGES " == *" 1 "* && " $EAPOL_MESSAGES " == *" 2 "* && \
+       " $EAPOL_MESSAGES " == *" 3 "* && " $EAPOL_MESSAGES " == *" 4 "* ]]
+}
+
+show_capture_status() {
+    if read_capture_status; then
+        success "Handshake EAPOL completo observado (mensagens 1, 2, 3 e 4; $EAPOL_COUNT quadros)."
+        return 0
+    else
+        local status=$?
+        if [[ "$status" -eq 2 ]]; then
+            warn "tshark indisponivel; abra a captura no Wireshark e aplique o filtro eapol."
+        elif (( EAPOL_COUNT > 0 )); then
+            info "EAPOL detectado: $EAPOL_COUNT quadro(s); mensagens vistas: ${EAPOL_MESSAGES:-indeterminadas}."
+        else
+            info "Nenhum quadro EAPOL do AP selecionado foi observado ainda."
+        fi
+        return 1
+    fi
+}
+
+wait_passively() {
+    local seconds
+    prompt_range "Aguardar reconexao natural por quantos segundos" 10 300 60
+    seconds="$INPUT_VALUE"
+    info "Modo passivo: nenhuma desconexao sera enviada."
+    local remaining="$seconds"
+    while (( remaining > 0 )); do
+        if read_capture_status; then
+            printf '\r%-70s\r' ' '
+            success "Handshake EAPOL completo observado."
+            return 0
+        fi
+        printf '\rAguardando reconexao natural... %3ss restantes' "$remaining"
+        sleep 2
+        remaining=$((remaining - 2))
+    done
+    printf '\r%-70s\r' ' '
+    show_capture_status || true
+}
+
+controlled_reauthentication() {
+    if (( DEAUTH_ATTEMPTS >= MAX_DEAUTH_ATTEMPTS )); then
+        warn "Limite de $MAX_DEAUTH_ATTEMPTS tentativas ativas atingido nesta sessao."
+        return 0
+    fi
+
+    local now elapsed
+    now="$(date +%s)"
+    elapsed=$((now - LAST_DEAUTH_EPOCH))
+    if (( LAST_DEAUTH_EPOCH > 0 && elapsed < DEAUTH_COOLDOWN_SECONDS )); then
+        warn "Protecao de intervalo: aguarde $((DEAUTH_COOLDOWN_SECONDS - elapsed))s antes de outra tentativa."
+        return 0
+    fi
+
+    show_clients || return 0
+    prompt_range "Escolha um unico cliente (0 nao e aceito)" 1 "${#CLIENT_MACS[@]}"
+    local client="${CLIENT_MACS[$((INPUT_VALUE - 1))]}"
+    local compact="${client//:/}" suffix expected answer
+    suffix="${compact: -6}"
+    expected="REAUTENTICAR $suffix"
+
+    printf '\nA ferramenta enviara uma rodada direcionada ao cliente %s.\n' "$client"
+    printf 'O aireplay-ng pode transmitir varias copias nessa rodada; nao existe\n'
+    printf 'opcao broadcast, contagem livre nem modo continuo.\n'
+    read -r -p "Digite exatamente '$expected': " answer
+    [[ "$answer" == "$expected" ]] || {
+        warn "Acao ativa cancelada."
+        return 0
+    }
+
+    info "Solicitando uma unica reautenticacao controlada..."
+    if timeout --signal=INT --kill-after=2 15s aireplay-ng --deauth "$DEAUTH_ROUNDS" \
+        -a "$TARGET_BSSID" -c "$client" "$MON_IFACE" 2>&1 | tee -a "$SESSION_LOG"; then
+        success "Tentativa controlada concluida. A captura continua ativa."
+    else
+        warn "O aireplay-ng terminou com aviso/erro; consulte $SESSION_LOG"
+    fi
+    DEAUTH_ATTEMPTS=$((DEAUTH_ATTEMPTS + 1))
+    LAST_DEAUTH_EPOCH="$(date +%s)"
+    sleep 3
+    show_capture_status || true
+}
+
+give_capture_to_desktop_user() {
+    local capture_file="$1"
+    if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" && "$SUDO_UID" =~ ^[0-9]+$ && "$SUDO_GID" =~ ^[0-9]+$ ]]; then
+        chgrp "$SUDO_GID" "$CAPTURE_ROOT" "$SESSION_DIR"
+        chmod 0750 "$CAPTURE_ROOT" "$SESSION_DIR"
+        chown "$SUDO_UID:$SUDO_GID" "$capture_file"
+        chmod 0640 "$capture_file"
+    fi
+}
+
+open_wireshark() {
+    stop_target_capture
+    local capture_file filter='eapol || wlan.fc.type_subtype == 0x000c'
+    capture_file="$(latest_capture_file)"
+    [[ -n "$capture_file" && -s "$capture_file" ]] || {
+        warn "Nenhum arquivo PCAP foi localizado para abrir."
+        return 1
+    }
+    give_capture_to_desktop_user "$capture_file"
+
+    if ! command -v wireshark >/dev/null 2>&1; then
+        warn "Wireshark GUI nao encontrado. Arquivo salvo em: $capture_file"
+        printf "Filtro sugerido: %s\n" "$filter"
+        return 1
+    fi
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        warn "Sessao grafica nao detectada. Abra depois com:"
+        printf "wireshark -r '%s' -Y '%s'\n" "$capture_file" "$filter"
+        return 1
+    fi
+
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && command -v sudo >/dev/null 2>&1; then
+        local desktop_home
+        desktop_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        nohup sudo -u "$SUDO_USER" env \
+            HOME="${desktop_home:-/tmp}" DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+            XAUTHORITY="${XAUTHORITY:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+            wireshark -r "$capture_file" -Y "$filter" >"$SESSION_DIR/wireshark.log" 2>&1 &
+    else
+        warn "Por seguranca, o Wireshark nao sera iniciado como root."
+        printf "Abra como usuario comum: wireshark -r '%s' -Y '%s'\n" "$capture_file" "$filter"
+        return 1
+    fi
+    OPENED_WIRESHARK=1
+    success "Captura aberta no Wireshark com filtro EAPOL/deauthentication."
+}
+
+capture_menu() {
+    while true; do
+        printf '\n%sAP selecionado%s: %s | %s | canal %s | %s\n' \
+            "$C_CYAN" "$C_RESET" "$(display_text "$TARGET_ESSID" 35)" "$TARGET_BSSID" \
+            "$TARGET_CHANNEL" "$TARGET_PRIVACY"
+        printf '  1) Verificar EAPOL capturado\n'
+        printf '  2) Aguardar reconexao passiva (recomendado)\n'
+        printf '  3) Atualizar lista de clientes\n'
+        printf '  4) Reautenticacao controlada de um cliente\n'
+        printf '  5) Encerrar captura e abrir no Wireshark\n'
+        printf '  0) Encerrar e apenas salvar\n'
+        prompt_range "Escolha" 0 5
+        case "$INPUT_VALUE" in
+            1) show_capture_status || true ;;
+            2) wait_passively ;;
+            3) show_clients || true ;;
+            4) controlled_reauthentication ;;
+            5)
+                open_wireshark || true
+                return 0
+                ;;
+            0)
+                stop_target_capture
+                return 0
+                ;;
+        esac
+    done
+}
+
+print_summary() {
+    local capture_file
+    capture_file="$(latest_capture_file)"
+    printf '\n%sResumo da sessao%s\n' "$C_CYAN" "$C_RESET"
+    printf '  Rede:       %s\n' "$(display_text "$TARGET_ESSID" 60)"
+    printf '  BSSID:      %s\n' "$TARGET_BSSID"
+    printf '  Canal:      %s\n' "$TARGET_CHANNEL"
+    printf '  Captura:    %s\n' "${capture_file:-nao gerada}"
+    printf '  Pasta:      %s\n' "$SESSION_DIR"
+    printf '  Deauth:     %d tentativa(s), maximo %d; sempre direcionado\n' "$DEAUTH_ATTEMPTS" "$MAX_DEAUTH_ATTEMPTS"
+    show_capture_status || true
+    (( OPENED_WIRESHARK )) && printf '  Wireshark:  aberto como usuario comum\n'
+    printf '\nNenhuma wordlist ou rotina de quebra de senha foi executada.\n'
+}
+
+dry_run() {
+    printf '%sValidacao sem alteracoes%s\n' "$C_CYAN" "$C_RESET"
+    local command_name
+    for command_name in airmon-ng airodump-ng aireplay-ng iw ip python3 timeout base64 tshark wireshark; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            printf '  [OK]      %s -> %s\n' "$command_name" "$(command -v "$command_name")"
+        else
+            printf '  [AUSENTE] %s\n' "$command_name"
+        fi
+    done
+    if [[ -n "$PARSER" ]]; then
+        printf '  [OK]      parser -> %s\n' "$PARSER"
+        python3 "$PARSER" --help >/dev/null
+    else
+        printf '  [AUSENTE] parser airodump_csv.py\n'
+    fi
+}
+
+main() {
+    parse_args "$@"
+    init_colors
+    print_banner
+    if (( DRY_RUN )); then
+        dry_run
+        return 0
+    fi
+
+    require_root
+    safety_gate
+    require_dependencies
+    prepare_directories
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+
+    info "Sessao: $SESSION_DIR"
+    select_interface
+    choose_band
+    pause_interfering_processes
+    enable_monitor_mode
+    run_scan
+    select_access_point
+    authorize_selected_bssid
+    start_target_capture
+    capture_menu
+    print_summary
+}
+
+main "$@"

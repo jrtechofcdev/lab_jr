@@ -1,0 +1,9 @@
+captures/
+*.cap
+*.pcap
+*.pcapng
+*.csv
+!tests/fixtures/*.csv
+*.log
+__pycache__/
+*.pyc
