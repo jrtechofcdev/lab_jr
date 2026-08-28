@@ -54,6 +54,19 @@ chmod +x install.sh jr-wifi-lab lib/airodump_csv.py
 sudo ./install.sh
 ```
 
+### Erro `invalid option name: pipefail`
+
+Esse erro indica que os scripts foram salvos com quebra de linha do Windows
+(`CRLF`). A pasta inclui um `.gitattributes` para manter os executáveis em
+formato Linux (`LF`) nos próximos clones. Para recuperar uma cópia que já esteja
+com o problema, execute dentro de `tools/jr-wifi-lab`:
+
+```bash
+sed -i 's/\r$//' install.sh jr-wifi-lab lib/airodump_csv.py tests/run.sh tests/test_parser.py
+chmod +x install.sh jr-wifi-lab lib/airodump_csv.py tests/run.sh
+sudo bash install.sh
+```
+
 Para instalar somente o modo terminal, sem a GUI do Wireshark:
 
 ```bash
